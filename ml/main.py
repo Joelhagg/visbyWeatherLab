@@ -1,10 +1,10 @@
-import requests
 import csv
 
+import requests
+
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from zoneinfo import ZoneInfo
-from io import StringIO
 
 
 SMHI_URL = (
@@ -41,11 +41,13 @@ def fetch_weather_data(url: str) -> dict:
 
     return response.json()
 
+
 def fetch_weather_archive(url: str) -> str:
     response = requests.get(url)
     response.raise_for_status()
 
     return response.text
+
 
 def parse_weather_archive(
     csv_data: str
@@ -106,57 +108,51 @@ def parse_weather_archive(
     return observations
 
 
-def get_noon_observations(data: dict) -> list[WeatherObservation]:
-    observations = data["value"]
-
-    noon_observations = []
-
-    for observation in observations:
-        timestamp = datetime.fromtimestamp(
-            observation["date"] / 1000,
-            timezone.utc
-        )
-
-        local_time = timestamp.astimezone(STOCKHOLM_TIMEZONE)
-
-        if local_time.hour == 12 and local_time.minute == 0:
-            weather_observation = WeatherObservation(
-                timestamp=local_time,
-                temperature=float(observation["value"]),
-                quality=observation["quality"],
-            )
-
-            noon_observations.append(weather_observation)
-
-    return noon_observations
-
-def get_noon_observation_from_archive(
-        observations: list[WeatherObservation]
-) -> list[WeatherObservation]:
-
-    noon_observations = []
-
-    for observation in observations:
-        if observation.timestamp.hour == 12 and observation.timestamp.minute == 0:
-            noon_observations.append(observation)
-
-    return noon_observations
-
-
-def get_temperature_for_date(
+def get_midday_observation(
     observations: list[WeatherObservation],
     target_date
-) -> float | None:
+) -> WeatherObservation | None:
 
-    for observation in observations:
-        if observation.timestamp.date() == target_date:
-            return observation.temperature
+    preferred_hours = [12, 13, 14]
+
+    for hour in preferred_hours:
+        for observation in observations:
+            if (
+                observation.timestamp.date() == target_date
+                and observation.timestamp.hour == hour
+                and observation.timestamp.minute == 0
+            ):
+                return observation
 
     return None
 
-def get_historical_average(
+def get_midday_observations(
         observations: list[WeatherObservation],
-        target_date
+) -> list[WeatherObservation]:
+
+    observations_by_date: dict[
+        date, 
+        list[WeatherObservation]
+    ] = {}
+
+    for observation in observations:
+        observation_date = observation.timestamp.date()
+        if observation_date not in observations_by_date:
+            observations_by_date[observation_date] = []
+        observations_by_date[observation_date].append(observation)
+
+    midday_observations: list[WeatherObservation] = []
+    for observation_date, daily_observations in observations_by_date.items():
+        midday_observation = get_midday_observation(daily_observations, observation_date)
+        if midday_observation:
+            midday_observations.append(midday_observation)
+
+    return midday_observations
+
+
+def get_historical_average(
+    observations: list[WeatherObservation],
+    target_date
 ) -> float | None:
 
     temperatures = []
@@ -165,7 +161,7 @@ def get_historical_average(
         observation_date = observation.timestamp.date()
 
         if (
-            observation_date.month == target_date.month 
+            observation_date.month == target_date.month
             and observation_date.day == target_date.day
         ):
             temperatures.append(observation.temperature)
@@ -175,138 +171,169 @@ def get_historical_average(
 
     return sum(temperatures) / len(temperatures)
 
-def get_approximate_observation(
-        observations: list[WeatherObservation],
-) -> list[WeatherObservation]:
+def get_historical_average_before_date(
+    observations: list[WeatherObservation],
+    target_date: date
+) -> float | None:
 
-    return [
-        observation 
-        for observation in observations
-        if observation.quality == "G"
-    ]
-
-def count_quality(
-    observations: list[WeatherObservation]
-) -> dict[str, int]:
-    quality_counts = {}
+    temperatures = []
 
     for observation in observations:
-        quality = observation.quality
+        observation_date = observation.timestamp.date()
 
-        if quality not in quality_counts:
-            quality_counts[quality] = 0
+        if (
+            observation_date.month == target_date.month
+            and observation_date.day == target_date.day
+            and observation_date < target_date
+        ):
+            temperatures.append(observation.temperature)
 
-        quality_counts[quality] += 1
+    if not temperatures:
+        return None
 
-    return quality_counts
+    return sum(temperatures) / len(temperatures)
+
+def calculate_baseline_mae(
+    observations: list[WeatherObservation],
+    start_year: int,
+    end_year: int
+) -> float | None:
+
+    errors = []
+
+    for year in range(start_year, end_year + 1):
+
+        for observation in observations:
+
+            target_date = observation.timestamp.date()
+
+            if target_date.year != year:
+                continue
+
+            prediction = get_historical_average_before_date(
+                observations,
+                target_date
+            )
+
+            if prediction is None:
+                continue
+
+            error = abs(
+                prediction - observation.temperature
+            )
+
+            errors.append(error)
+
+    if not errors:
+        return None
+
+    return sum(errors) / len(errors)
 
 
 def main():
     print("Visby Weather Lab Started!")
 
-    data = fetch_weather_data(SMHI_URL)
-
-    noon_observations = get_noon_observations(data)
-
-    print(
-        f"Antal 12:00-observationer: "
-        f"{len(noon_observations)}"
-    )
-
-    if noon_observations:
-        print(
-            f"Första observationen: "
-            f"{noon_observations[0]}"
-        )
-
-    today = datetime.now(STOCKHOLM_TIMEZONE).date()
-
-    historical_average = get_historical_average(
-        noon_observations,
-        today
-    )
-
-    print(
-        f"Historiskt medel för " 
-        f"{today}: kl 12:00: "
-        f"{historical_average} °C"
-    )
-
-    target_date = datetime(2026, 4, 28).date()
-
-    temperature = get_temperature_for_date(
-        noon_observations,
-        target_date
-    )
-
-    print(
-        f"Temperatur {target_date} kl. 12:00: "
-        f"{temperature} °C"
-    )
-
-
     archive = fetch_weather_archive(
         SMHI_ARCHIVE_URL
     )
 
-    archive_observations = parse_weather_archive(
+    observations = parse_weather_archive(
         archive
     )
 
     print(
         f"Antal historiska observationer: "
-        f"{len(archive_observations)}"
+        f"{len(observations)}"
+    )
+
+    today = datetime.now(
+        STOCKHOLM_TIMEZONE
+    ).date()
+
+    midday_observation = get_midday_observation(
+        observations,
+        today
+    )
+
+    if midday_observation:
+        print(
+            f"Temperatur mitt på dagen "
+            f"{today}: "
+            f"{midday_observation.temperature} °C "
+            f"({midday_observation.timestamp.strftime('%H:%M')})"
+        )
+    else:
+        print(
+            f"Ingen observation mitt på dagen "
+            f"hittades för {today}."
+        )
+
+
+    midday_observations = get_midday_observations(
+        observations
+    )
+
+    historical_average = get_historical_average(
+        midday_observations,
+        today
     )
 
     print(
-        f"Första historiska observationen: "
-        f"{archive_observations[0]}"
+        f"Historiskt medel för "
+        f"{today}: "
+        f"{historical_average} °C"
     )
 
     print(
-        f"Sista historiska observationen: "
-        f"{archive_observations[-1]}"
-    )
-
-    archive_noon_observations = get_noon_observation_from_archive(
-        archive_observations
+        f"Antal dagar med mitt-på-dagen-observation: "
+        f"{len(midday_observations)}"
     )
 
     print(
-        f"Antal historiska 12:00-observationer: "
-        f"{len(archive_noon_observations)}"
+        f"Första observationen: "
+        f"{midday_observations[0]}"
     )
 
     print(
-        f"Första historiska 12:00-observationen: "
-        f"{archive_noon_observations[0]}"
+        f"Sista observationen: "
+        f"{midday_observations[-1]}"
     )
-    
+
+    test_date = date(2020, 9, 6)
+
+    prediction = get_historical_average_before_date(
+        midday_observations,
+        test_date
+    )
+
+    actual = get_midday_observation(
+        midday_observations,
+        test_date
+    )
+
     print(
-        f"Sista historiska 12:00-observationen: "
-        f"{archive_noon_observations[-1]}"
-    )
-
-    approved_noon_observations = get_approximate_observation(
-        archive_noon_observations
+        f"\nTestdatum: {test_date}"
     )
 
     print(
-        f"Godkända historiska 12:00-observationer: "
-        f"{len(approved_noon_observations)}"
+        f"Historiskt medel: {prediction:.2f} °C"
     )
 
-
-    quality_counts = count_quality(
-        archive_noon_observations
+    print(
+        f"Faktisk temperatur: "
+        f"{actual.temperature:.2f} °C"
     )
 
-    print("Kvalitetsfördelning:")
+    baseline_mae = calculate_baseline_mae(
+        midday_observations,
+        2010,
+        2020
+    )
 
-    for quality, count in quality_counts.items():
-        print(f"{quality}: {count}")
-
-    
+    print(
+        f"Baseline MAE 2010-2020: "
+        f"{baseline_mae:.2f} °C"
+    )
 
 
 if __name__ == "__main__":
