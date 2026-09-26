@@ -6,7 +6,12 @@ from datetime import date, datetime, timezone
 from zoneinfo import ZoneInfo
 
 
+
 VISBY_AIRPORT = 78400
+
+SMHI_AIR_TEMPERATURE = 1
+SMHI_WIND_SPEED = 4
+
 STOCKHOLM_TIMEZONE = ZoneInfo("Europe/Stockholm")
 
 SMHI_BASE_URL = (
@@ -275,7 +280,7 @@ def main() -> None:
     # --------------------------------------------------
 
     temperature_url = build_smhi_archive_url(
-        parameter_id=1,
+        parameter_id = SMHI_AIR_TEMPERATURE,
         station_id=VISBY_AIRPORT,
     )
 
