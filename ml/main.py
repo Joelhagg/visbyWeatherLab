@@ -5,7 +5,12 @@ from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from zoneinfo import ZoneInfo
 
-
+from database import (
+    get_connection,
+    get_station_id,
+    get_parameter_id,
+    save_observation
+)
 
 VISBY_AIRPORT = 78400
 
@@ -23,7 +28,6 @@ SMHI_LATEST_URL = (
     "https://opendata-download-metobs.smhi.se/"
     "api/version/latest.json"
 )
-
 
 @dataclass
 class WeatherObservation:
@@ -275,6 +279,29 @@ def calculate_baseline_mae(
 def main() -> None:
     print("Visby Weather Lab Started!")
 
+    connection = get_connection()
+    cursor = connection.cursor()
+
+    database_station_id = get_station_id(
+        cursor,
+        VISBY_AIRPORT,
+    )
+
+    database_temperature_parameter_id = get_parameter_id(
+        cursor,
+        SMHI_AIR_TEMPERATURE,
+    )
+
+    print(
+        f"Database station ID: "
+        f"{database_station_id}"
+    )
+
+    print(
+        f"Database temperature parameter ID: "
+        f"{database_temperature_parameter_id}"
+    )
+
     # --------------------------------------------------
     # TEMPERATURE
     # --------------------------------------------------
@@ -297,6 +324,22 @@ def main() -> None:
         f"Antal historiska temperaturobservationer: "
         f"{len(temperature_observations)}"
     )
+
+    if temperature_observations:
+
+        observation = temperature_observations[0]
+
+        saved = save_observation(
+            cursor,
+            database_station_id,
+            database_temperature_parameter_id,
+            observation
+        )
+
+        if saved:
+            print("Observation sparad i PostgreSQL!")
+        else:
+            print("Observationen fanns redan.")
 
     today = datetime.now(
         STOCKHOLM_TIMEZONE
@@ -375,6 +418,11 @@ def main() -> None:
             f"{first_wind_observation.value:.2f} m/s "
             f"({first_wind_observation.quality})"
         )
+
+    connection.commit()
+
+    cursor.close()
+    connection.close()
 
 
 if __name__ == "__main__":
