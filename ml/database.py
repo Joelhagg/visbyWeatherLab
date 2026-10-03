@@ -1,5 +1,8 @@
 import psycopg
 
+from models import WeatherObservation
+from training import ModelResult
+
 
 def get_connection():
     return psycopg.connect(
@@ -61,73 +64,131 @@ def get_parameter_id(
     return result[0]
 
 
-def save_observation(
+def get_observations(
     cursor,
     station_id: int,
     parameter_id: int,
-    observation,
-) -> bool:
+) -> list[WeatherObservation]:
 
     cursor.execute(
         """
-        INSERT INTO observations (
-            station_id,
-            parameter_id,
+        SELECT
             timestamp,
             value,
             quality
-        )
-        VALUES (
-            %s,
-            %s,
-            %s,
-            %s,
-            %s
-        )
-        ON CONFLICT (
-            station_id,
-            parameter_id,
-            timestamp
-        )
-        DO NOTHING;
+        FROM observations
+        WHERE station_id = %s
+          AND parameter_id = %s
+        ORDER BY timestamp;
         """,
         (
             station_id,
             parameter_id,
-            observation.timestamp,
-            observation.value,
-            observation.quality,
         ),
     )
 
-    return cursor.rowcount == 1
+    rows = cursor.fetchall()
+
+    return [
+        WeatherObservation(
+            timestamp=row[0],
+            value=row[1],
+            quality=row[2],
+        )
+        for row in rows
+    ]
 
 
-def main():
+def save_observations(
+    cursor,
+    station_id: int,
+    parameter_id: int,
+    observations,
+    batch_size: int = 5000,
+):
+    total = len(observations)
+
+    for start in range(0, total, batch_size):
+
+        batch = observations[
+            start:start + batch_size
+        ]
+
+        cursor.executemany(
+            """
+            INSERT INTO observations (
+                station_id,
+                parameter_id,
+                timestamp,
+                value,
+                quality
+            )
+            VALUES (
+                %s,
+                %s,
+                %s,
+                %s,
+                %s
+            )
+            ON CONFLICT (
+                station_id,
+                parameter_id,
+                timestamp
+            )
+            DO NOTHING;
+            """,
+            [
+                (
+                    station_id,
+                    parameter_id,
+                    observation.timestamp,
+                    observation.value,
+                    observation.quality,
+                )
+                for observation in batch
+            ],
+        )
+
+        processed = min(
+            start + batch_size,
+            total,
+        )
+
+        print(
+            f"Sparat {processed:,} / {total:,} "
+            f"observationer."
+        )
+
+
+def save_model_result(
+        model_result: ModelResult,
+) -> None:
     connection = get_connection()
 
-    print("Ansluten till PostgreSQL!")
-
-    cursor = connection.cursor()
-
-    station_id = get_station_id(
-        cursor,
-        78400,
-    )
-
-    parameter_id = get_parameter_id(
-        cursor,
-        1,
-    )
-
-    print(f"Databas station_id: {station_id}")
-    print(f"Databas parameter_id: {parameter_id}")
-
-    connection.commit()
-
-    cursor.close()
-    connection.close()
-
-
-if __name__ == "__main__":
-    main()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO model_results (
+                    trained_at,
+                    mae,
+                    training_samples,
+                    features
+                )
+                VALUES (
+                    %s,
+                    %s,
+                    %s,
+                    %s
+                )
+                """,
+                (
+                    model_result.trained_at,
+                    model_result.mae,
+                    model_result.training_samples,
+                    model_result.features,
+                )
+            )
+        connection.commit()
+    finally:
+        connection.close()

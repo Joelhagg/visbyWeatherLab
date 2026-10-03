@@ -1,16 +1,33 @@
+from datetime import date, datetime, timezone
+from zoneinfo import ZoneInfo
+
 import csv
 import requests
 
-from dataclasses import dataclass
-from datetime import date, datetime, timezone
-from zoneinfo import ZoneInfo
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_absolute_error
 
 from database import (
     get_connection,
     get_station_id,
     get_parameter_id,
-    save_observation
+    get_observations,
+    save_observations,
+    save_model_result,
 )
+
+from models import WeatherObservation
+
+from training import(
+    ModelResult,
+    build_training_samples,
+    build_features,
+    build_targets,
+    split_training_data,
+    get_midday_observation,
+    get_midday_observations,
+) 
+
 
 VISBY_AIRPORT = 78400
 
@@ -24,22 +41,12 @@ SMHI_BASE_URL = (
     "api/version/1.0"
 )
 
-SMHI_LATEST_URL = (
-    "https://opendata-download-metobs.smhi.se/"
-    "api/version/latest.json"
-)
-
-@dataclass
-class WeatherObservation:
-    timestamp: datetime
-    value: float
-    quality: str
-
 
 def build_smhi_archive_url(
     parameter_id: int,
     station_id: int,
 ) -> str:
+
     return (
         f"{SMHI_BASE_URL}/"
         f"parameter/{parameter_id}/"
@@ -50,36 +57,11 @@ def build_smhi_archive_url(
 
 
 def fetch_weather_archive(url: str) -> str:
+
     response = requests.get(url)
     response.raise_for_status()
 
     return response.text
-
-
-def fetch_smhi_parameter(
-    parameter_id: int,
-    station_id: int,
-    period: str = "latest-months",
-) -> dict:
-    url = (
-        f"{SMHI_BASE_URL}/"
-        f"parameter/{parameter_id}/"
-        f"station/{station_id}/"
-        f"period/{period}/"
-        "data.json"
-    )
-
-    response = requests.get(url)
-    response.raise_for_status()
-
-    return response.json()
-
-
-def fetch_smhi_catalog() -> dict:
-    response = requests.get(SMHI_LATEST_URL)
-    response.raise_for_status()
-
-    return response.json()
 
 
 def parse_weather_archive(
@@ -94,6 +76,7 @@ def parse_weather_archive(
     data_start = None
 
     for index, line in enumerate(lines):
+
         if line.startswith(
             f"Datum;Tid (UTC);{value_column};Kvalitet"
         ):
@@ -102,7 +85,8 @@ def parse_weather_archive(
 
     if data_start is None:
         raise ValueError(
-            f"Kunde inte hitta CSV-data för '{value_column}'."
+            f"Kunde inte hitta CSV-data "
+            f"för '{value_column}'."
         )
 
     data_lines = lines[data_start:]
@@ -113,6 +97,7 @@ def parse_weather_archive(
     )
 
     for row in reader:
+
         if not row["Datum"]:
             continue
 
@@ -139,61 +124,6 @@ def parse_weather_archive(
 
     return observations
 
-
-def get_midday_observation(
-    observations: list[WeatherObservation],
-    target_date: date,
-) -> WeatherObservation | None:
-
-    # Our definition of "midday":
-    # 12:00 is preferred, 13:00 is fallback.
-    preferred_hours = [12, 13]
-
-    for hour in preferred_hours:
-        for observation in observations:
-            if (
-                observation.timestamp.date() == target_date
-                and observation.timestamp.hour == hour
-                and observation.timestamp.minute == 0
-            ):
-                return observation
-
-    return None
-
-
-def get_midday_observations(
-    observations: list[WeatherObservation],
-) -> list[WeatherObservation]:
-
-    observations_by_date: dict[
-        date,
-        list[WeatherObservation],
-    ] = {}
-
-    for observation in observations:
-        observation_date = observation.timestamp.date()
-
-        observations_by_date.setdefault(
-            observation_date,
-            [],
-        ).append(observation)
-
-    midday_observations = []
-
-    for observation_date, daily_observations in (
-        observations_by_date.items()
-    ):
-        midday_observation = get_midday_observation(
-            daily_observations,
-            observation_date,
-        )
-
-        if midday_observation:
-            midday_observations.append(
-                midday_observation
-            )
-
-    return midday_observations
 
 
 def get_historical_average(
@@ -251,6 +181,7 @@ def calculate_baseline_mae(
     errors = []
 
     for year in range(start_year, end_year + 1):
+
         for observation in observations:
 
             target_date = observation.timestamp.date()
@@ -267,7 +198,9 @@ def calculate_baseline_mae(
                 continue
 
             errors.append(
-                abs(prediction - observation.value)
+                abs(
+                    prediction - observation.value
+                )
             )
 
     if not errors:
@@ -277,6 +210,7 @@ def calculate_baseline_mae(
 
 
 def main() -> None:
+
     print("Visby Weather Lab Started!")
 
     connection = get_connection()
@@ -287,94 +221,185 @@ def main() -> None:
         VISBY_AIRPORT,
     )
 
-    database_temperature_parameter_id = get_parameter_id(
+    database_temperature_parameter_id = (
+        get_parameter_id(
+            cursor,
+            SMHI_AIR_TEMPERATURE,
+        )
+    )
+
+    temperature_observations = get_observations(
         cursor,
-        SMHI_AIR_TEMPERATURE,
+        database_station_id,
+        database_temperature_parameter_id,
+    )
+
+    training_samples = build_training_samples(
+        temperature_observations
     )
 
     print(
-        f"Database station ID: "
-        f"{database_station_id}"
+        f"Antal training samples: "
+        f"{len(training_samples)}"
     )
 
     print(
-        f"Database temperature parameter ID: "
-        f"{database_temperature_parameter_id}"
-    )
-
-    # --------------------------------------------------
-    # TEMPERATURE
-    # --------------------------------------------------
-
-    temperature_url = build_smhi_archive_url(
-        parameter_id = SMHI_AIR_TEMPERATURE,
-        station_id=VISBY_AIRPORT,
-    )
-
-    temperature_archive = fetch_weather_archive(
-        temperature_url,
-    )
-
-    temperature_observations = parse_weather_archive(
-        temperature_archive,
-        "Lufttemperatur",
+        f"Första training sample: "
+        f"{training_samples[0]}"
     )
 
     print(
-        f"Antal historiska temperaturobservationer: "
+        f"Antal temperatur-observationer "
+        f"från PostgreSQL: "
         f"{len(temperature_observations)}"
+    )
+
+    train_samples, test_samples = split_training_data(
+        training_samples
+    )
+
+    X_train = build_features(train_samples)
+    y_train = build_targets(train_samples)
+
+    X_test = build_features(test_samples)
+    y_test = build_targets(test_samples)
+
+    model = LinearRegression()
+
+    model.fit(
+        X_train,
+        y_train,
+    )
+
+    print("Coefficients:", model.coef_)
+    print("Intercept:", model.intercept_)
+
+    predictions = model.predict(
+        X_test
+    )
+
+    mae = mean_absolute_error(
+        y_test,
+        predictions,
+    )
+
+    print(
+        f"Linear Regression MAE: "
+        f"{mae:.2f} °C"
+    )
+
+    model_result = ModelResult(
+        trained_at=datetime.now(),
+        mae=mae,
+        training_samples=len(X_train),
+        features=[
+            "sin_day_of_year",
+            "cos_day_of_year",
+            "previous_temperature",
+        ],
+    )
+
+    save_model_result(
+        model_result
+    )
+
+    print("Model Result:")
+    print(model_result)
+
+    for index in range(5):
+
+        print(
+            f"Prediction: "
+            f"{predictions[index]:.2f} °C | "
+            f"Actual: "
+            f"{y_test[index]:.2f} °C"
+        )
+
+    print(
+        f"Antal training samples: "
+        f"{len(train_samples)}"
+    )
+
+    print(
+        f"Antal test samples: "
+        f"{len(test_samples)}"
+    )
+
+    print(
+        f"Första training sample: "
+        f"{train_samples[0]}"
+    )
+
+    print(
+        f"Första test sample: "
+        f"{test_samples[0]}"
+    )
+
+    features = build_features(
+        training_samples
+    )
+
+    targets = build_targets(
+        training_samples
+    )
+
+    print(
+        f"Första features: "
+        f"{features[0]}"
+    )
+
+    print(
+        f"Första target: "
+        f"{targets[0]}"
     )
 
     if temperature_observations:
 
-        observation = temperature_observations[0]
-
-        saved = save_observation(
-            cursor,
-            database_station_id,
-            database_temperature_parameter_id,
-            observation
+        print(
+            f"Första observationen: "
+            f"{temperature_observations[0]}"
         )
-
-        if saved:
-            print("Observation sparad i PostgreSQL!")
-        else:
-            print("Observationen fanns redan.")
 
     today = datetime.now(
         STOCKHOLM_TIMEZONE
     ).date()
 
-    midday_temperature_observations = (
+    midday_observations = (
         get_midday_observations(
             temperature_observations,
         )
     )
 
     today_midday = get_midday_observation(
-        midday_temperature_observations,
+        midday_observations,
         today,
     )
 
     if today_midday:
+
         print(
             f"Temperatur mitt på dagen "
             f"{today}: "
             f"{today_midday.value:.2f} °C "
             f"({today_midday.timestamp.strftime('%H:%M')})"
         )
+
     else:
+
         print(
             f"Ingen observation mitt på dagen "
             f"hittades för {today}."
         )
 
-    historical_average = get_historical_average(
-        midday_temperature_observations,
-        today,
+    historical_average = (
+        get_historical_average(
+            midday_observations,
+            today,
+        )
     )
 
     if historical_average is not None:
+
         print(
             f"Historiskt medel för "
             f"{today}: "
@@ -382,44 +407,10 @@ def main() -> None:
         )
 
     print(
-        f"Antal dagar med mitt-på-dagen-observation: "
-        f"{len(midday_temperature_observations)}"
+        f"Antal dagar med "
+        f"mitt-på-dagen-observation: "
+        f"{len(midday_observations)}"
     )
-
-    # --------------------------------------------------
-    # WIND
-    # --------------------------------------------------
-
-    wind_url = build_smhi_archive_url(
-        parameter_id=4,
-        station_id=VISBY_AIRPORT,
-    )
-
-    wind_archive = fetch_weather_archive(
-        wind_url,
-    )
-
-    wind_observations = parse_weather_archive(
-        wind_archive,
-        "Vindhastighet",
-    )
-
-    print(
-        f"Antal historiska vindobservationer: "
-        f"{len(wind_observations)}"
-    )
-
-    if wind_observations:
-        first_wind_observation = wind_observations[0]
-
-        print(
-            f"Första vindobservationen: "
-            f"{first_wind_observation.timestamp} - "
-            f"{first_wind_observation.value:.2f} m/s "
-            f"({first_wind_observation.quality})"
-        )
-
-    connection.commit()
 
     cursor.close()
     connection.close()
